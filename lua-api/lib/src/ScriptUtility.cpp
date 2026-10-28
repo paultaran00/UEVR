@@ -237,6 +237,26 @@ sol::object prop_to_object(sol::this_state s, void* self, uevr::API::FProperty* 
 
             return sol::make_object(s, lua_arr);
         }
+        case L"StructProperty"_fnv:
+        {
+            // GoW E-Day mod: arrays of structs, as StructObjects pointing into the array (no copies)
+            const auto& arr = *(uevr::API::TArray<uint8_t>*)((uintptr_t)self + offset);
+            const auto struct_desc = ((uevr::API::FStructProperty*)inner_prop)->get_struct();
+
+            if (arr.data == nullptr || arr.count == 0 || struct_desc == nullptr) {
+                return sol::make_object(s, sol::lua_nil);
+            }
+
+            const auto stride = ((uevr::API::UScriptStruct*)struct_desc)->get_struct_size();
+            auto lua_arr = sol::state_view{s}.create_table();
+
+            for (size_t i = 0; i < arr.count; ++i) {
+                auto elem = std::make_unique<lua::datatypes::StructObject>((void*)(arr.data + i * stride), struct_desc);
+                lua_arr[i + 1] = sol::make_object(s, std::move(elem));
+            }
+
+            return sol::make_object(s, lua_arr);
+        }
         // TODO: Add support for other types
         };
 

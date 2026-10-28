@@ -42,6 +42,25 @@
 #include "Mods.hpp"
 #include "PluginLoader.hpp"
 
+namespace eday_menu {
+extern bool enabled;
+extern bool click_right, click_left;
+extern bool hover;
+extern int active;
+extern float hit_dist[2];
+extern float beam[2][6];
+extern unsigned long long moved_at;
+extern bool dev_ray_on[2];
+extern float dev_ray[2][6];
+extern bool panel_ok;
+extern glm::vec3 panel_c, panel_ax, panel_ay, panel_n, panel_head;
+extern float panel_w, panel_h;
+extern float hit_uv[2][2];
+}
+
+static uint64_t g_eday_load_result{0}; // VR_LoadAsset (set_mod_value) -> VR_LoadAssetResult
+static bool g_eday_load_root{false};   // VR_LoadAssetRoot
+
 UEVR_PluginVersion g_plugin_version{
     UEVR_PLUGIN_VERSION_MAJOR, UEVR_PLUGIN_VERSION_MINOR, UEVR_PLUGIN_VERSION_PATCH};
 
@@ -1394,6 +1413,104 @@ void set_mod_value(const char* key, const char* value) {
         return;
     }
 
+    // E-Day menu pointer (OverlayComponent.cpp): "VR_MenuPointer" = "on click_right click_left" (0/1 each).
+    if (std::string_view{key} == "VR_MenuPointer") {
+        int on = 0, cr = 0, cl = 0, wheel = 0, hov = 0;
+        sscanf_s(value, "%d %d %d %d %d", &on, &cr, &cl, &wheel, &hov);
+        eday_menu::hover = hov != 0; // 5th field: the mouse follows the pointer (else it moves only to click)
+        // a stick scroll: mouse wheel notches (+ up), sent where the pointer is
+        if (on != 0 && wheel != 0 && GetForegroundWindow() == g_framework->get_window()) {
+            INPUT in{}; in.type = INPUT_MOUSE; in.mi.dwFlags = MOUSEEVENTF_WHEEL; in.mi.mouseData = (DWORD)(wheel * WHEEL_DELTA);
+            SendInput(1, &in, sizeof(INPUT));
+        }
+        eday_menu::enabled = on != 0;
+        eday_menu::click_right = cr != 0;
+        eday_menu::click_left = cl != 0;
+        return;
+    }
+
+    // E-Day dev (tests without awake controllers): "VR_MenuPointerDev" = "side ox oy oz dx dy dz" replaces that
+    // controller's aim ray (side 0 right, 1 left; tracking space, m); "side off" or "off" (both) ends it
+    if (std::string_view{key} == "VR_MenuPointerDev") {
+        int side = -1;
+        float r[6]{};
+        const int n = sscanf_s(value, "%d %f %f %f %f %f %f", &side, &r[0], &r[1], &r[2], &r[3], &r[4], &r[5]);
+        if (n == 7 && (side == 0 || side == 1)) {
+            for (int k = 0; k < 6; ++k) eday_menu::dev_ray[side][k] = r[k];
+            eday_menu::dev_ray_on[side] = true;
+        } else if (n >= 1 && (side == 0 || side == 1)) {
+            eday_menu::dev_ray_on[side] = false;
+        } else {
+            eday_menu::dev_ray_on[0] = eday_menu::dev_ray_on[1] = false;
+        }
+        return;
+    }
+
+    // E-Day: "VR_LoadAsset" = "<package FName qword hex> <asset FName qword hex>" (from KismetSystemLibrary
+    // MakeSoftObjectPath): loads the asset from disk with KismetSystemLibrary::LoadAsset_Blocking - the scripts need
+    // their effects / meshes in every chapter, and a TSoftObjectPtr parameter cannot be passed from Lua.
+    // Result: get "VR_LoadAssetResult" = the loaded object's address (hex, 0 = failed).
+    // E-Day: monitor-only stabilization (eday_stab): "on" / "off", optionally followed by min_cut beta max_deg zoom
+    if (std::string_view{key} == "VR_DesktopStabilize") {
+        char mode[8]{};
+        float v[4]{eday_stab::min_cut, eday_stab::beta, eday_stab::max_deg, eday_stab::zoom};
+        int off = eday_stab::frame_offset;
+        const int n = sscanf_s(value, "%7s %f %f %f %f %d", mode, (unsigned)sizeof(mode), &v[0], &v[1], &v[2], &v[3], &off);
+        if (n >= 1) {
+            eday_stab::on = std::string_view{mode} != "off";
+            eday_stab::min_cut = v[0]; eday_stab::beta = v[1]; eday_stab::max_deg = v[2]; eday_stab::zoom = v[3];
+            eday_stab::frame_offset = off;
+        }
+        return;
+    }
+    if (std::string_view{key} == "VR_LoadAssetRoot") { // "1": loaded assets get the root set flag (default off)
+        g_eday_load_root = std::string_view{value} == "1";
+        return;
+    }
+    if (std::string_view{key} == "VR_LoadAsset") {
+        unsigned long long pkg = 0, asset = 0;
+        g_eday_load_result = 0;
+        if (sscanf_s(value, "%llx %llx", &pkg, &asset) == 2) {
+            static auto fn = sdk::find_uobject<sdk::UFunction>(L"Function /Script/Engine.KismetSystemLibrary.LoadAsset_Blocking");
+            static auto ks = sdk::find_uobject<sdk::UClass>(L"Class /Script/Engine.KismetSystemLibrary");
+            if (fn != nullptr && ks != nullptr) {
+                // TSoftObjectPtr<UObject> { FWeakObjectPtr (8), FSoftObjectPath { PackageName, AssetName, FString } } + UObject* return
+                alignas(16) uint8_t params[0x40]{};
+                *(uint64_t*)&params[8] = pkg;
+                *(uint64_t*)&params[16] = asset;
+                ks->get_class_default_object()->process_event(fn, params);
+                g_eday_load_result = *(uint64_t*)&params[0x28];
+                // kept loaded for good (nothing of the game's references it: garbage collection would unload it
+                // under the scripts): the root set flag, as UObject::AddToRoot - only if the engine object (always
+                // rooted) shows that flag where expected in this build
+                constexpr int32_t ROOT_SET = 1 << 30;
+                auto arr = sdk::FUObjectArray::get();
+                auto engine = (sdk::UObjectBase*)sdk::UEngine::get();
+                if (g_eday_load_result != 0 && arr != nullptr && engine != nullptr) {
+                    auto eitem = arr->get_object((int32_t)engine->get_internal_index());
+                    auto obj = (sdk::UObjectBase*)g_eday_load_result;
+                    auto item = arr->get_object((int32_t)obj->get_internal_index());
+                    const bool flag_ok = g_eday_load_root && eitem != nullptr && eitem->object == engine && (eitem->flags & ROOT_SET) != 0;
+                    if (flag_ok && item != nullptr && item->object == obj) {
+                        item->flags |= ROOT_SET;
+                    }
+                    spdlog::info("[E-Day] VR_LoadAsset {:x}: engine flags {:x}, rooted {}", g_eday_load_result,
+                        eitem != nullptr ? eitem->flags : 0, flag_ok && item != nullptr && item->object == obj);
+                }
+            }
+        }
+        return;
+    }
+
+    // E-Day: "px py pz dx dy dz" in VR tracking space, see VR::set_aim_override. Not a saved setting.
+    if (std::string_view{key} == "VR_AimOverride") {
+        glm::vec3 pos{}, dir{};
+        if (sscanf_s(value, "%f %f %f %f %f %f", &pos.x, &pos.y, &pos.z, &dir.x, &dir.y, &dir.z) == 6) {
+            VR::get()->set_aim_override(pos, dir);
+        }
+        return;
+    }
+
     auto& mods = g_framework->get_mods()->get_mods();
 
     for (auto& mod : mods) {
@@ -1408,6 +1525,40 @@ void set_mod_value(const char* key, const char* value) {
 
 void get_mod_value(const char* key, char* out_value, unsigned int max_size) {
     if (key == nullptr || out_value == nullptr || max_size == 0) {
+        return;
+    }
+
+    // E-Day: "on yaw pitch roll step frame min_cut beta max_deg zoom" (last monitor correction, deg; raw head step, deg)
+    if (std::string_view{key} == "VR_DesktopStabilize") {
+        const auto& l = eday_stab::last;
+        snprintf(out_value, max_size, "%d %.4f %.4f %.4f %.4f %.0f %.3f %.3f %.3f %.3f %d", eday_stab::on ? 1 : 0, l[0], l[1], l[2], l[3], l[4],
+            eday_stab::min_cut, eday_stab::beta, eday_stab::max_deg, eday_stab::zoom, eday_stab::frame_offset);
+        return;
+    }
+    if (std::string_view{key} == "VR_LoadAssetResult") {
+        snprintf(out_value, max_size, "%llx", (unsigned long long)g_eday_load_result);
+        return;
+    }
+
+    // E-Day menu pointer: "dist_right dist_left active" (meters along each controller's aim ray, -1 = no hit)
+    if (std::string_view{key} == "VR_MenuPointerHit") {
+        const auto& b = eday_menu::beam;
+        snprintf(out_value, max_size, "%.4f %.4f %d %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %llu",
+            eday_menu::hit_dist[0], eday_menu::hit_dist[1], eday_menu::active,
+            b[0][0], b[0][1], b[0][2], b[0][3], b[0][4], b[0][5], b[1][0], b[1][1], b[1][2], b[1][3], b[1][4], b[1][5],
+            GetTickCount64() - eday_menu::moved_at);
+        return;
+    }
+
+    // E-Day dev: the menu panel of the last pointer update (tracking space): "ok cx cy cz axx axy axz ayx ayy ayz
+    // w h headx heady headz u0 v0 u1 v1" (ax right, ay up, w/h meters; hit uv of the right / left beam, -1 = none)
+    if (std::string_view{key} == "VR_MenuPanel") {
+        using namespace eday_menu;
+        snprintf(out_value, max_size, "%d %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f",
+            panel_ok ? 1 : 0, panel_c.x, panel_c.y, panel_c.z, panel_ax.x, panel_ax.y, panel_ax.z, panel_ay.x, panel_ay.y, panel_ay.z,
+            panel_w, panel_h, panel_head.x, panel_head.y, panel_head.z,
+            hit_dist[0] >= 0.0f ? hit_uv[0][0] : -1.0f, hit_dist[0] >= 0.0f ? hit_uv[0][1] : -1.0f,
+            hit_dist[1] >= 0.0f ? hit_uv[1][0] : -1.0f, hit_dist[1] >= 0.0f ? hit_uv[1][1] : -1.0f);
         return;
     }
 
