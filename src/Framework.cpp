@@ -1892,6 +1892,15 @@ bool Framework::init_d3d12() {
     
     auto device = m_d3d12_hook->get_device();
 
+    // Only succeeds when the D3D12 debug layer is on (tools\d3d12debug): stop right at the bad barrier
+    // (#524 RESOURCE_BARRIER_MISMATCHING_MISC_FLAGS) so the crash dump has the culprit on the stack.
+    if (ID3D12InfoQueue* info_queue{}; device != nullptr && SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&info_queue)))) {
+        info_queue->SetBreakOnID(D3D12_MESSAGE_ID_RESOURCE_BARRIER_MISMATCHING_MISC_FLAGS, TRUE);
+        info_queue->SetBreakOnID(D3D12_MESSAGE_ID_RESOURCE_BARRIER_INVALID_COMBINATION, TRUE);
+        info_queue->Release();
+        spdlog::info("[D3D12] Debug layer detected, breaking on RESOURCE_BARRIER_MISMATCHING_MISC_FLAGS");
+    }
+
     spdlog::info("[D3D12] Creating command allocator...");
 
     m_d3d12.cmd_ctxs.clear();

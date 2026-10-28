@@ -71,6 +71,13 @@ void LuaLoader::on_frame() {
         spdlog::info("[LuaLoader] Lua state initialized.");
     }
 
+    // Debug aid: create "reload_scripts" in the profile folder to reload all Lua scripts without restarting the game.
+    if (const auto req = Framework::get_persistent_dir("reload_scripts"); !m_needs_first_reset && std::filesystem::exists(req)) {
+        std::filesystem::remove(req);
+        spdlog::info("[LuaLoader] reload_scripts found, reloading Lua scripts...");
+        reset_scripts();
+    }
+
     for (auto state_to_delete : m_states_to_delete) {
         std::erase_if(m_states, [&](std::shared_ptr<ScriptState> state) { return state->lua().lua_state() == state_to_delete; });
     }

@@ -516,6 +516,14 @@ void UObjectHook::on_config_save(utility::Config& cfg) {
 void UObjectHook::on_pre_engine_tick(sdk::UGameEngine* engine, float delta) {
     m_last_delta_time = delta;
 
+    // Debug aid: create "dump_sdk_request" in the profile folder to run the SDK dump (same as the Dump SDK button).
+    if (const auto req = Framework::get_persistent_dir("dump_sdk_request"); std::filesystem::exists(req)) {
+        std::filesystem::remove(req);
+        SPDLOG_INFO("[UObjectHook] dump_sdk_request found, dumping SDK...");
+        SDKDumper::dump();
+        SPDLOG_INFO("[UObjectHook] SDK dump finished");
+    }
+
     if (m_wants_activate) {
         hook();
     }
