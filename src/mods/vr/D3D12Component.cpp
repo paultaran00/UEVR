@@ -1,4 +1,6 @@
 #include <d3dcompiler.h>
+#include <chrono>
+#include <glm/gtc/quaternion.hpp>
 
 #include <openvr.h>
 #include <utility/String.hpp>
@@ -10,6 +12,8 @@
 
 #include <../../directxtk12-src/Inc/ResourceUploadBatch.h>
 #include <../../directxtk12-src/Inc/RenderTargetState.h>
+#include <../../directxtk12-src/Inc/ScreenGrab.h>
+#include <wincodec.h>
 
 #include "shaders/Compiled/alpha_luminance_sprite_ps_SpritePixelShader.inc"
 #include "shaders/Compiled/alpha_luminance_sprite_ps_SpriteVertexShader.inc"
@@ -22,6 +26,69 @@
 
 constexpr auto ENGINE_SRC_DEPTH = D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 constexpr auto ENGINE_SRC_COLOR = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+// E-Day: monitor-only stabilization. The headset pose UEVR renders with jitters ~0.3 deg back and forth per frame
+// (Quest over Steam Link / OpenXR); the headset's own reprojection hides it, the monitor shows it. The rendered right
+// eye is drawn on the monitor turned by the difference between the rendered head rotation and a One-Euro smoothed one.
+namespace eday_stab {
+bool on{false}; // (switched on by the scripts: fp.lua)
+float min_cut{1.5f}, beta{0.08f}, max_deg{1.5f}, zoom{1.05f};
+int frame_offset{0}; // pose of frame (m_frame_count + offset)
+float last[5]{};
+
+static glm::quat s_smooth{1, 0, 0, 0}, s_prev{1, 0, 0, 0};
+static float s_speed{0.0f};
+static int s_frame{-1};
+static std::chrono::steady_clock::time_point s_time{};
+static bool s_init{false};
+
+// the rendered head rotation -> the correction (view space: x right, y up, -z forward) as yaw / pitch / roll (rad)
+static void update(const glm::quat& q, int frame, float out[3]) {
+    out[0] = out[1] = out[2] = 0.0f;
+    const auto now = std::chrono::steady_clock::now();
+    if (!s_init) {
+        s_smooth = s_prev = q;
+        s_time = now;
+        s_frame = frame;
+        s_init = true;
+    }
+    if (frame != s_frame) { // once per rendered frame
+        const float dt = std::clamp(std::chrono::duration<float>(now - s_time).count(), 0.001f, 0.1f);
+        s_time = now;
+        s_frame = frame;
+        const auto ang = [](const glm::quat& a, const glm::quat& b) {
+            return glm::degrees(2.0f * std::acos(std::min(1.0f, std::abs(glm::dot(a, b)))));
+        };
+        const float step = ang(s_prev, q);
+        s_prev = q;
+        const auto alpha = [dt](float cut) { const float tau = 1.0f / (2.0f * glm::pi<float>() * cut); return 1.0f / (1.0f + tau / dt); };
+        s_speed += (step / dt - s_speed) * alpha(2.0f); // deg/s, low-passed (the noise alone is ~20 deg/s)
+        s_smooth = glm::slerp(s_smooth, q, alpha(min_cut + beta * s_speed));
+        // never further than max_deg from the rendered rotation (a fast turn: follow, no black edges)
+        const float off = ang(s_smooth, q);
+        if (off > max_deg) {
+            s_smooth = glm::slerp(q, s_smooth, max_deg / off);
+        }
+        last[3] = step;
+        last[4] = (float)frame;
+    }
+    if (!on) {
+        s_smooth = q;
+        last[0] = last[1] = last[2] = 0.0f;
+        return;
+    }
+    // C = smoothed^-1 * rendered: where the rendered view's centre and right axis land in the smoothed view
+    const glm::quat c = glm::inverse(s_smooth) * q;
+    const glm::vec3 f = c * glm::vec3{0, 0, -1};
+    const glm::vec3 r = c * glm::vec3{1, 0, 0};
+    out[0] = f.x / -f.z;               // right (tan)
+    out[1] = f.y / -f.z;               // up (tan)
+    out[2] = std::atan2(r.y, r.x);     // counter-clockwise (view space)
+    last[0] = glm::degrees(std::atan(out[0]));
+    last[1] = glm::degrees(std::atan(out[1]));
+    last[2] = glm::degrees(out[2]);
+}
+}
 
 namespace vrmod {
 vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
@@ -69,6 +136,43 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
     if (backbuffer == nullptr) {
         SPDLOG_ERROR_EVERY_N_SEC(1, "[VR] Failed to get back buffer.");
         return vr::VRCompositorError_None;
+    }
+
+    // Debug aid: create "dump_request" in the profile folder to save the eye texture and the real
+    // back buffer as PNGs next to it (lets us see what goes to the headset without wearing it).
+    // With "dump_every" present it dumps every 10 s to dump_eye_<n>.dds (n = 0..29, wraps).
+    static auto last_auto_dump = std::chrono::steady_clock::now();
+    static int auto_dump_index = 0;
+    const auto auto_dump = std::filesystem::exists(Framework::get_persistent_dir("dump_every")) &&
+        std::chrono::steady_clock::now() - last_auto_dump > std::chrono::seconds(10);
+
+    if (auto_dump) {
+        last_auto_dump = std::chrono::steady_clock::now();
+        const auto name = "dump_eye_" + std::to_string(auto_dump_index++ % 30) + ".dds";
+        const auto hr = DirectX::SaveDDSTextureToFile(command_queue, backbuffer.Get(),
+            Framework::get_persistent_dir(name).wstring().c_str(), ENGINE_SRC_COLOR, ENGINE_SRC_COLOR);
+        spdlog::info("[VR] Auto-dumped {} ({:x})", name, (uint32_t)hr);
+    }
+
+    if (const auto req = Framework::get_persistent_dir("dump_request"); std::filesystem::exists(req)) {
+        std::filesystem::remove(req);
+        const auto eye_hr = DirectX::SaveDDSTextureToFile(command_queue, backbuffer.Get(),
+            Framework::get_persistent_dir("dump_eye.dds").wstring().c_str(), ENGINE_SRC_COLOR, ENGINE_SRC_COLOR);
+        const auto bb_hr = DirectX::SaveWICTextureToFile(command_queue, real_backbuffer.Get(), GUID_ContainerFormatPng,
+            Framework::get_persistent_dir("dump_backbuffer.png").wstring().c_str(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_PRESENT);
+
+        if (m_openvr.ui_tex.texture.Get() != nullptr) {
+            const auto ovr_hr = DirectX::SaveDDSTextureToFile(command_queue, m_openvr.ui_tex.texture.Get(),
+                Framework::get_persistent_dir("dump_openvr_ui.dds").wstring().c_str(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            spdlog::info("[VR] Dumped OpenVR UI texture ({:x})", (uint32_t)ovr_hr);
+        }
+
+        if (const auto ui = VR::get()->m_fake_stereo_hook->get_render_target_manager()->get_ui_target(); ui != nullptr) {
+            const auto ui_hr = DirectX::SaveDDSTextureToFile(command_queue, (ID3D12Resource*)ui->get_native_resource(),
+                Framework::get_persistent_dir("dump_ui.dds").wstring().c_str(), ENGINE_SRC_COLOR, ENGINE_SRC_COLOR);
+            spdlog::info("[VR] Dumped UI texture ({:x})", (uint32_t)ui_hr);
+        }
+        spdlog::info("[VR] Dumped eye texture ({:x}) and back buffer ({:x})", (uint32_t)eye_hr, (uint32_t)bb_hr);
     }
 
     const auto ui_should_invert_alpha = vr->get_overlay_component().should_invert_ui_alpha();
@@ -367,8 +471,13 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         if (is_right_eye_frame) {
             if (is_2d_screen) {
                 m_openvr.ui_tex.commands.copy(m_2d_screen_tex[0].texture.Get(), m_openvr.ui_tex.texture.Get(), ENGINE_SRC_COLOR);
-            } else if (ui_target != nullptr) {
-                m_openvr.ui_tex.commands.copy((ID3D12Resource*)ui_target->get_native_resource(), m_openvr.ui_tex.texture.Get(), ENGINE_SRC_COLOR);
+            } else if (ui_target != nullptr && m_game_ui_tex.texture.Get() != nullptr && m_game_ui_tex.srv_heap != nullptr) {
+                // Draw instead of CopyResource: the engine leaves its UI render target compressed (fast clear) in a
+                // state we cannot know, so a raw copy read zeros while sampling it (spectator view) works (E-Day).
+                const float transparent[] = { 0.0f, 0.0f, 0.0f, 0.0f };
+                m_openvr.ui_tex.commands.clear_rtv(m_openvr.ui_tex, transparent, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                d3d12::render_srv_to_rtv(m_game_batch.get(), m_openvr.ui_tex.commands.cmd_list.Get(), m_game_ui_tex, m_openvr.ui_tex,
+                    ENGINE_SRC_COLOR, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             }
         } else if (is_2d_screen) {
             m_openvr.ui_tex.commands.copy(m_2d_screen_tex[0].texture.Get(), m_openvr.ui_tex.texture.Get(), ENGINE_SRC_COLOR);
@@ -376,6 +485,16 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
 
         clear_rt(m_openvr.ui_tex.commands);
         m_openvr.ui_tex.commands.execute();
+
+        // Debug aid: "dump_ui_after" dumps the overlay texture right after this frame's copy finished on the GPU.
+        if (const auto req = Framework::get_persistent_dir("dump_ui_after"); std::filesystem::exists(req)) {
+            std::filesystem::remove(req);
+            m_openvr.ui_tex.commands.wait(INFINITE);
+            const auto hr = DirectX::SaveDDSTextureToFile(command_queue, m_openvr.ui_tex.texture.Get(),
+                Framework::get_persistent_dir("dump_openvr_ui_after.dds").wstring().c_str(),
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            spdlog::info("[VR] Dumped OpenVR UI texture after copy ({:x}), copied this frame: {}", (uint32_t)hr, is_right_eye_frame && ui_target != nullptr);
+        }
     } else if (runtime->is_openxr() && runtime->ready() && vr->m_openxr->frame_began) {
         if (is_right_eye_frame) {
             if (is_2d_screen) {
@@ -674,6 +793,9 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                 }
             }
 
+            // E-Day: the menu pointer's beams and dots, over the menu
+            openxr_overlay.append_eday_pointer_layers(quad_layers);
+
             auto result = vr->m_openxr->end_frame(quad_layers, scene_depth_tex.Get() != nullptr);
 
             if (result == XR_ERROR_LAYER_INVALID) {
@@ -927,11 +1049,33 @@ void D3D12Component::draw_spectator_view(ID3D12GraphicsCommandList* command_list
     ID3D12DescriptorHeap* game_heaps[] = { m_game_tex.srv_heap->Heap() };
     command_list->SetDescriptorHeaps(1, game_heaps);
 
-    batch->Draw(m_game_tex.get_srv_gpu(), 
-        DirectX::XMUINT2{ (uint32_t)m_backbuffer_size[0], (uint32_t)m_backbuffer_size[1] },
-        dest_rect,
-        &source_rect, 
-        DirectX::Colors::White);
+    // E-Day: steadied against headset tracking noise (eday_stab): the eye picture shifted / turned by the difference
+    // between the rendered head rotation and a smoothed one, zoomed a little so its edges stay off screen
+    {
+        const int shown_eye = (vr->is_using_afr() || vr->is_native_stereo_fix_enabled()) ? 0 : 1;
+        // (during on_present m_frame_count is this picture's frame; m_render_frame_count still the previous one's
+        //  until on_post_present - the first version used it and added the frame-to-frame motion instead of removing it)
+        const int pose_frame = vr->get_frame_count() + eday_stab::frame_offset;
+        const glm::quat q = glm::quat_cast(vr->get_hmd_rotation(pose_frame));
+        float c[3]{};
+        eday_stab::update(q, pose_frame, c);
+        const auto& proj = vr->get_runtime()->raw_projections[shown_eye];
+        const float tan_w = std::abs(proj[1] - proj[0]), tan_h = std::abs(proj[2] - proj[3]);
+        const float src_w = (float)(source_rect.right - source_rect.left), src_h = (float)(source_rect.bottom - source_rect.top);
+        const float sx = (float)desc.Width / src_w, sy = (float)desc.Height / src_h;
+        const float z = eday_stab::on ? eday_stab::zoom : 1.0f;
+        // eye texture pixels per tangent unit, then monitor pixels
+        const float dx = tan_w > 0.01f ? c[0] * eye_width / tan_w * sx * z : 0.0f;
+        const float dy = tan_h > 0.01f ? -c[1] * eye_height / tan_h * sy * z : 0.0f;
+        batch->Draw(m_game_tex.get_srv_gpu(),
+            DirectX::XMUINT2{ (uint32_t)m_backbuffer_size[0], (uint32_t)m_backbuffer_size[1] },
+            DirectX::XMFLOAT2{ (float)desc.Width * 0.5f + dx, (float)desc.Height * 0.5f + dy },
+            &source_rect,
+            DirectX::Colors::White,
+            -c[2], // view counter-clockwise (y up) = screen clockwise-negative (y down)
+            DirectX::XMFLOAT2{ src_w * 0.5f, src_h * 0.5f },
+            DirectX::XMFLOAT2{ sx * z, sy * z });
+    }
 
     //////
     // UI
@@ -945,12 +1089,140 @@ void D3D12Component::draw_spectator_view(ID3D12GraphicsCommandList* command_list
         dest_rect, 
         DirectX::Colors::White);
 
+    // E-Day: the menu pointer's beams and dots over the menu (in the headset they are compositor layers)
+    eday_draw_desktop_pointer(command_list, (float)desc.Width, (float)desc.Height);
+
     batch->End();
 
     // Transition backbuffer to D3D12_RESOURCE_STATE_PRESENT
     barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
     barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
     command_list->ResourceBarrier(1, &barrier);
+}
+
+bool D3D12Component::eday_pointer_texture() {
+    if (m_eday_pointer_tex.texture != nullptr && m_eday_pointer_tex.srv_heap != nullptr) {
+        return true;
+    }
+
+    if (m_eday_pointer_tex_failed) {
+        return false;
+    }
+
+    m_eday_pointer_tex_failed = true; // (one try)
+
+    auto device = g_framework->get_d3d12_hook()->get_device();
+
+    if (device == nullptr) {
+        return false;
+    }
+
+    D3D12_HEAP_PROPERTIES heap_props{};
+    heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = 64;
+    rd.Height = 32;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1;
+    rd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+    ComPtr<ID3D12Resource> res{};
+
+    if (FAILED(device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&res)))) {
+        spdlog::error("[VR] E-Day: desktop menu pointer texture not created");
+        return false;
+    }
+
+    if (!m_eday_pointer_tex.setup(device, res.Get(), DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM, L"E-Day desktop pointer")) {
+        spdlog::error("[VR] E-Day: desktop menu pointer texture setup failed");
+        m_eday_pointer_tex.reset();
+        return false;
+    }
+
+    // drawn once with clears: transparent, the left half white, the disc row by row
+    auto& cmds = m_eday_pointer_tex.commands;
+    const auto rtv = m_eday_pointer_tex.get_rtv();
+    const float transparent[4]{0.0f, 0.0f, 0.0f, 0.0f};
+    const float white[4]{1.0f, 1.0f, 1.0f, 1.0f};
+    cmds.cmd_list->ClearRenderTargetView(rtv, transparent, 0, nullptr);
+
+    std::vector<D3D12_RECT> rects{};
+    rects.push_back(D3D12_RECT{0, 0, 32, 32});
+
+    for (int y = 0; y < 32; ++y) {
+        const float dy = (float)y + 0.5f - 16.0f;
+        const float r2 = 15.5f * 15.5f - dy * dy;
+
+        if (r2 <= 0.0f) {
+            continue;
+        }
+
+        const float half = std::sqrt(r2);
+        rects.push_back(D3D12_RECT{(LONG)std::lround(48.0f - half), (LONG)y, (LONG)std::lround(48.0f + half), (LONG)y + 1});
+    }
+
+    cmds.cmd_list->ClearRenderTargetView(rtv, white, (UINT)rects.size(), rects.data());
+
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = res.Get();
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    cmds.cmd_list->ResourceBarrier(1, &barrier);
+    cmds.has_commands = true;
+    cmds.execute(); // (before the spectator view's list on the same queue)
+
+    m_eday_pointer_tex_failed = false;
+    spdlog::info("[VR] E-Day: desktop menu pointer texture created");
+    return true;
+}
+
+void D3D12Component::eday_draw_desktop_pointer(ID3D12GraphicsCommandList* command_list, float width, float height) {
+    eday_menu::DesktopPointer ptr{};
+
+    if (!eday_menu::desktop_pointer(width, height, ptr) || !eday_pointer_texture()) {
+        return;
+    }
+
+    auto& batch = m_backbuffer_batch;
+    ID3D12DescriptorHeap* heaps[] = { m_eday_pointer_tex.srv_heap->Heap() };
+    command_list->SetDescriptorHeaps(1, heaps);
+
+    const auto srv = m_eday_pointer_tex.get_srv_gpu();
+    const DirectX::XMUINT2 tex_size{64, 32};
+    const RECT solid{8, 8, 24, 24}; // (inside the white half, away from the disc)
+    const RECT disc{32, 0, 64, 32};
+
+    // as in the headset: beam (70,150,255) at 0.78 alpha, dot (190,225,255); premultiplied (SpriteBatch's alpha blend)
+    const float ba = 200.0f / 255.0f;
+    const DirectX::XMVECTORF32 beam_color{{{70.0f / 255.0f * ba, 150.0f / 255.0f * ba, 1.0f * ba, ba}}};
+    const DirectX::XMVECTORF32 dot_color{{{190.0f / 255.0f, 225.0f / 255.0f, 1.0f, 1.0f}}};
+
+    for (int i = 0; i < 2; ++i) {
+        if (!ptr.beam[i]) {
+            continue;
+        }
+
+        const float dx = ptr.b[i][0] - ptr.a[i][0];
+        const float dy = ptr.b[i][1] - ptr.a[i][1];
+        const float len = std::sqrt(dx * dx + dy * dy);
+
+        if (len >= 1.0f) {
+            batch->Draw(srv, tex_size, DirectX::XMFLOAT2{ptr.a[i][0], ptr.a[i][1]}, &solid, beam_color,
+                std::atan2(dy, dx), DirectX::XMFLOAT2{0.0f, 8.0f}, DirectX::XMFLOAT2{len / 16.0f, ptr.beam_px / 16.0f});
+        }
+
+        if (ptr.dot[i]) {
+            batch->Draw(srv, tex_size, DirectX::XMFLOAT2{ptr.b[i][0], ptr.b[i][1]}, &disc, dot_color,
+                0.0f, DirectX::XMFLOAT2{16.0f, 16.0f}, DirectX::XMFLOAT2{ptr.dot_px / 32.0f, ptr.dot_px / 32.0f});
+        }
+    }
 }
 
 void D3D12Component::clear_backbuffer() {
@@ -1065,6 +1337,8 @@ void D3D12Component::on_reset(VR* vr) {
 
     m_openvr.ui_tex.reset();
     m_game_ui_tex.reset();
+    m_eday_pointer_tex.reset();
+    m_eday_pointer_tex_failed = false;
     m_game_tex.reset();
     m_scene_capture_tex.reset();
     m_backbuffer_batch.reset();
@@ -1428,8 +1702,11 @@ std::optional<std::string> D3D12Component::OpenXR::create_swapchains() {
                 // Depth stencil textures don't need an RTV.
                 if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) == 0) {
                     if (ctx.texture_contexts[index]->create_rtv(device, (DXGI_FORMAT)swapchain_create_info.format)) {
+                        // E-Day: the menu pointer's swapchain is filled once with the beam colour (linear, sRGB target)
                         const float clear_color[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-                        texture_ctx->commands.clear_rtv(ctx.textures[index].texture, texture_ctx->get_rtv(), clear_color, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                        const float eday_beam_color[4] = {0.06f, 0.30f, 1.0f, 0.8f};
+                        const auto is_eday_beam = i == (uint32_t)runtimes::OpenXR::SwapchainIndex::EDAY_BEAM;
+                        texture_ctx->commands.clear_rtv(ctx.textures[index].texture, texture_ctx->get_rtv(), is_eday_beam ? eday_beam_color : clear_color, D3D12_RESOURCE_STATE_RENDER_TARGET);
                         texture_ctx->commands.execute();
                         texture_ctx->commands.wait(100);
                     } else {
@@ -1531,6 +1808,23 @@ std::optional<std::string> D3D12Component::OpenXR::create_swapchains() {
 
     if (auto err = create_swapchain((uint32_t)runtimes::OpenXR::SwapchainIndex::FRAMEWORK_UI, desktop_rt_swapchain_create_info, desktop_rt_desc)) {
         return err;
+    }
+
+    // E-Day: the menu pointer's beams and dots are quad layers of one small solid swapchain (filled once, static)
+    {
+        auto beam_info = desktop_rt_swapchain_create_info;
+        beam_info.width = 16;
+        beam_info.height = 16;
+        beam_info.createFlags = XR_SWAPCHAIN_CREATE_STATIC_IMAGE_BIT;
+        beam_info.usageFlags = XR_SWAPCHAIN_USAGE_SAMPLED_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+
+        auto beam_desc = desktop_rt_desc;
+        beam_desc.Width = 16;
+        beam_desc.Height = 16;
+
+        if (auto err = create_swapchain((uint32_t)runtimes::OpenXR::SwapchainIndex::EDAY_BEAM, beam_info, beam_desc)) {
+            spdlog::error("[VR] E-Day: menu pointer swapchain not created: {}", *err); // (the menu works without beams)
+        }
     }
 
     // Depth textures

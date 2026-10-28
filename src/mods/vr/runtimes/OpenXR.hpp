@@ -336,6 +336,7 @@ public:
         UI = EXTRA_START,
         UI_RIGHT, // For 2D view with stereoscopic
         FRAMEWORK_UI,
+        EDAY_BEAM, // E-Day: one solid colour (static image), the menu pointer's beams and dots (OverlayComponent.cpp)
 
         EXTRA_END,
 

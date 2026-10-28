@@ -55,6 +55,12 @@ private:
     void draw_spectator_view(ID3D12GraphicsCommandList* command_list, bool is_right_eye_frame);
     void clear_backbuffer();
 
+    // E-Day: the menu pointer on the desktop (draw_spectator_view): 64x32, left half solid white, right half a white disc
+    bool eday_pointer_texture();
+    void eday_draw_desktop_pointer(ID3D12GraphicsCommandList* command_list, float width, float height);
+    d3d12::TextureContext m_eday_pointer_tex{};
+    bool m_eday_pointer_tex_failed{false};
+
     template <typename T> using ComPtr = Microsoft::WRL::ComPtr<T>;
 
     ComPtr<ID3D12Resource> m_prev_backbuffer{};

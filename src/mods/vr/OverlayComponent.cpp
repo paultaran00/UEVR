@@ -7,6 +7,228 @@
 
 #include "OverlayComponent.hpp"
 
+// E-Day menu pointer state (see PluginLoader set/get_mod_value "VR_MenuPointer*")
+namespace eday_menu {
+bool enabled{false};
+bool click_right{false}, click_left{false};
+bool hover{false};
+bool was_down{false};
+int active{0}; // 0 right, 1 left
+float hit_dist[2]{-1.0f, -1.0f};
+float hit_uv[2][2]{};
+float beam[2][6]{}; // start xyz, end xyz (tracking space, meters)
+unsigned long long moved_at{0}; // when the mouse was last moved (scripts keep the gamepad prompts)
+// the menu panel and head of the last pointer update (tracking space), for the desktop view
+bool panel_ok{false};
+glm::vec3 panel_c{}, panel_ax{}, panel_ay{}, panel_n{}, panel_head{};
+float panel_w{1.0f}, panel_h{1.0f};
+bool ray_ok[2]{false, false}; // the side's ray this frame (tracked controller or dev ray)
+bool dev_ray_on[2]{false, false}; // "VR_MenuPointerDev" (PluginLoader.cpp)
+float dev_ray[2][6]{};
+}
+
+// The beams are OpenVR overlays too (thin quads), so they are drawn over the game's 3D scene like the menu itself
+// (as world geometry they ended behind the menu scene's floor and walls)
+static vr::VROverlayHandle_t eday_beam_ov[2]{vr::k_ulOverlayHandleInvalid, vr::k_ulOverlayHandleInvalid};
+static vr::VROverlayHandle_t eday_dot_ov[2]{vr::k_ulOverlayHandleInvalid, vr::k_ulOverlayHandleInvalid};
+static const float EDAY_BEAM_W = 0.004f;  // m
+static const float EDAY_DOT_W = 0.014f;   // m
+static void edayBeamOverlays() {
+    if (eday_beam_ov[0] != vr::k_ulOverlayHandleInvalid) return;
+    static uint8_t beam_px[4 * 64 * 4];
+    static uint8_t dot_px[16 * 16 * 4];
+    for (int i = 0; i < 4 * 64; ++i) { beam_px[i * 4] = 70; beam_px[i * 4 + 1] = 150; beam_px[i * 4 + 2] = 255; beam_px[i * 4 + 3] = 200; }
+    for (int y = 0; y < 16; ++y) for (int x = 0; x < 16; ++x) {
+        const float dx = x - 7.5f, dy = y - 7.5f;
+        const bool in = dx * dx + dy * dy <= 56.0f;
+        uint8_t* q = &dot_px[(y * 16 + x) * 4];
+        q[0] = 190; q[1] = 225; q[2] = 255; q[3] = in ? 255 : 0;
+    }
+    for (int i = 0; i < 2; ++i) {
+        const std::string n = std::string{"EDayBeam"} + (i == 0 ? "R" : "L");
+        if (vr::VROverlay()->CreateOverlay(n.c_str(), n.c_str(), &eday_beam_ov[i]) == vr::VROverlayError_None) {
+            vr::VROverlay()->SetOverlayRaw(eday_beam_ov[i], beam_px, 4, 64, 4);
+            vr::VROverlay()->SetOverlayWidthInMeters(eday_beam_ov[i], EDAY_BEAM_W);
+            vr::VROverlay()->SetOverlaySortOrder(eday_beam_ov[i], 10);
+        }
+        const std::string d = std::string{"EDayDot"} + (i == 0 ? "R" : "L");
+        if (vr::VROverlay()->CreateOverlay(d.c_str(), d.c_str(), &eday_dot_ov[i]) == vr::VROverlayError_None) {
+            vr::VROverlay()->SetOverlayRaw(eday_dot_ov[i], dot_px, 16, 16, 4);
+            vr::VROverlay()->SetOverlayWidthInMeters(eday_dot_ov[i], EDAY_DOT_W);
+            vr::VROverlay()->SetOverlaySortOrder(eday_dot_ov[i], 11);
+        }
+    }
+}
+// Show/Hide only on a change (called every frame before: suspected of compositor stutter)
+static bool eday_shown[4]{false, false, false, false}; // (a new overlay starts hidden)
+static void edayShow(int k, vr::VROverlayHandle_t h, bool on) {
+    if (h == vr::k_ulOverlayHandleInvalid || eday_shown[k] == on) return;
+    eday_shown[k] = on;
+    if (on) vr::VROverlay()->ShowOverlay(h); else vr::VROverlay()->HideOverlay(h);
+}
+static void edayPlace(vr::VROverlayHandle_t h, const glm::vec3& xax, const glm::vec3& yax, const glm::vec3& zax, const glm::vec3& pos) {
+    glm::mat4 m{1.0f};
+    m[0] = glm::vec4{xax, 0.0f}; m[1] = glm::vec4{yax, 0.0f}; m[2] = glm::vec4{zax, 0.0f}; m[3] = glm::vec4{pos, 1.0f};
+    const auto sm = Matrix3x4f{glm::rowMajor4(m)};
+    vr::VROverlay()->SetOverlayTransformAbsolute(h, vr::TrackingUniverseStanding, (vr::HmdMatrix34_t*)&sm);
+}
+
+bool eday_menu::desktop_pointer(float W, float H, DesktopPointer& out) {
+    out = DesktopPointer{};
+    if (!enabled || !panel_ok || W < 1.0f || H < 1.0f) return false;
+    const auto& vr = VR::get();
+    if (vr == nullptr || !vr->is_hmd_active()) return false;
+    // the menu's normal pointing away from the head; depth = distance in front of the head along it
+    const glm::vec3 nf = glm::dot(panel_c - panel_head, panel_n) >= 0.0f ? panel_n : -panel_n;
+    const float D = glm::dot(panel_c - panel_head, nf);
+    if (D < 0.05f) return false;
+    const float NEAR_M = 0.1f;
+    auto depth = [&](const glm::vec3& p) { return glm::dot(p - panel_head, nf); };
+    auto to_px = [&](const glm::vec3& p, float* px) {
+        const glm::vec3 q = panel_head + (p - panel_head) * (D / depth(p));
+        px[0] = (glm::dot(q - panel_c, panel_ax) / panel_w + 0.5f) * W;
+        px[1] = (0.5f - glm::dot(q - panel_c, panel_ay) / panel_h) * H;
+    };
+    const float px_per_m = H / panel_h;
+    out.beam_px = std::max(3.0f, H / 360.0f);
+    out.dot_px = std::max(12.0f, EDAY_DOT_W * px_per_m);
+    bool any = false;
+    for (int i = 0; i < 2; ++i) {
+        if (!ray_ok[i]) continue;
+        glm::vec3 a{beam[i][0], beam[i][1], beam[i][2]}, b{beam[i][3], beam[i][4], beam[i][5]};
+        float da = depth(a), db = depth(b);
+        if (da < NEAR_M && db < NEAR_M) continue;
+        // (the part behind the head is cut off)
+        if (da < NEAR_M) { a = a + (b - a) * ((NEAR_M - da) / (db - da)); }
+        if (db < NEAR_M) { b = b + (a - b) * ((NEAR_M - db) / (da - db)); }
+        to_px(a, out.a[i]);
+        to_px(b, out.b[i]);
+        out.beam[i] = true;
+        out.dot[i] = hit_dist[i] >= 0.0f;
+        if (out.dot[i]) {
+            // the dot exactly on the hit (the spot the mouse clicks)
+            out.b[i][0] = hit_uv[i][0] * W;
+            out.b[i][1] = hit_uv[i][1] * H;
+        }
+        any = true;
+    }
+    return any;
+}
+
+// openvr_draw: draw the beams/dots as OpenVR overlays here; on OpenXR only the hits, beam ends and clicks are worked
+// out (the layers come from OverlayComponent::OpenXR::append_eday_pointer_layers)
+static void edayMenuPointer(VR* vr, const glm::mat4& panel, float width_m, float height_m, bool openvr_draw = true) {
+    using namespace eday_menu;
+    hit_dist[0] = hit_dist[1] = -1.0f;
+    if (!enabled) {
+        // the beam overlays exist only while the pointer is on (title stuttered with them merely created)
+        for (int i = 0; i < 2 && openvr_draw; ++i) {
+            if (eday_beam_ov[i] != vr::k_ulOverlayHandleInvalid) { vr::VROverlay()->DestroyOverlay(eday_beam_ov[i]); eday_beam_ov[i] = vr::k_ulOverlayHandleInvalid; }
+            if (eday_dot_ov[i] != vr::k_ulOverlayHandleInvalid) { vr::VROverlay()->DestroyOverlay(eday_dot_ov[i]); eday_dot_ov[i] = vr::k_ulOverlayHandleInvalid; }
+        }
+        for (int k = 0; k < 4; ++k) eday_shown[k] = false;
+        ray_ok[0] = ray_ok[1] = false;
+        if (was_down) {
+            INPUT in{}; in.type = INPUT_MOUSE; in.mi.dwFlags = MOUSEEVENTF_LEFTUP; SendInput(1, &in, sizeof(INPUT));
+            was_down = false;
+        }
+        return;
+    }
+    if (openvr_draw) edayBeamOverlays();
+    const glm::vec3 c{panel[3]};
+    const glm::vec3 ax{glm::normalize(glm::vec3{panel[0]})};
+    const glm::vec3 ay{glm::normalize(glm::vec3{panel[1]})};
+    const glm::vec3 n{glm::normalize(glm::vec3{panel[2]})};
+    const int idx[2]{vr->get_right_controller_index(), vr->get_left_controller_index()};
+    panel_c = c; panel_ax = ax; panel_ay = ay; panel_n = n;
+    panel_w = width_m; panel_h = height_m;
+    panel_head = glm::vec3{vr->get_position(0)};
+    panel_ok = width_m > 0.0f && height_m > 0.0f;
+    for (int i = 0; i < 2; ++i) {
+        ray_ok[i] = false;
+        glm::vec3 o{}, dir{};
+        if (dev_ray_on[i]) {
+            o = glm::vec3{dev_ray[i][0], dev_ray[i][1], dev_ray[i][2]};
+            dir = glm::vec3{dev_ray[i][3], dev_ray[i][4], dev_ray[i][5]};
+            if (glm::length(dir) < 1e-4f) continue;
+            dir = glm::normalize(dir);
+        } else {
+            if (idx[i] < 0) continue;
+            o = glm::vec3{vr->get_aim_position(idx[i])};
+            const auto rot = vr->get_aim_rotation(idx[i]);
+            dir = glm::normalize(-glm::vec3{rot[2]});
+        }
+        ray_ok[i] = true;
+        for (int k = 0; k < 3; ++k) { beam[i][k] = o[k]; beam[i][3 + k] = o[k] + dir[k] * 1.5f; }
+        const float dn = glm::dot(dir, n);
+        if (std::abs(dn) < 1e-4f) continue;
+        const float t = glm::dot(c - o, n) / dn;
+        if (t <= 0.0f || t > 20.0f) continue;
+        const glm::vec3 h = o + dir * t;
+        const float u = glm::dot(h - c, ax) / width_m + 0.5f;
+        const float v = 0.5f - glm::dot(h - c, ay) / height_m;
+        if (u < 0.0f || u > 1.0f || v < 0.0f || v > 1.0f) continue;
+        hit_dist[i] = t;
+        for (int k = 0; k < 3; ++k) beam[i][3 + k] = h[k];
+        hit_uv[i][0] = u; hit_uv[i][1] = v;
+    }
+    // draw: each beam a quad from the controller to its end (hit or 1.5 m), turned to face the head; dots on hits
+    const glm::vec3 head{vr->get_position(0)};
+    for (int i = 0; i < 2 && openvr_draw; ++i) {
+        if (eday_beam_ov[i] == vr::k_ulOverlayHandleInvalid || !ray_ok[i]) continue;
+        const glm::vec3 a{beam[i][0], beam[i][1], beam[i][2]}, b{beam[i][3], beam[i][4], beam[i][5]};
+        const glm::vec3 d = b - a;
+        const float len = glm::length(d);
+        if (len < 0.01f) { edayShow(i, eday_beam_ov[i], false); continue; }
+        const glm::vec3 yax = d / len;
+        const glm::vec3 mid = (a + b) * 0.5f;
+        glm::vec3 to_eye = head - mid;
+        glm::vec3 zax = to_eye - yax * glm::dot(to_eye, yax);
+        if (glm::length(zax) < 1e-4f) zax = glm::vec3{0, 1, 0};
+        zax = glm::normalize(zax);
+        const glm::vec3 xax = glm::normalize(glm::cross(yax, zax));
+        // the 4x64 texture is stretched along y: its height = width * 64/4 / texel aspect
+        vr::VROverlay()->SetOverlayTexelAspect(eday_beam_ov[i], (64.0f / 4.0f) * EDAY_BEAM_W / len);
+        edayPlace(eday_beam_ov[i], xax, yax, zax, mid);
+        edayShow(i, eday_beam_ov[i], true);
+        if (hit_dist[i] >= 0.0f) {
+            edayPlace(eday_dot_ov[i], ax, ay, n, b + n * 0.002f);
+            edayShow(2 + i, eday_dot_ov[i], true);
+        } else {
+            edayShow(2 + i, eday_dot_ov[i], false);
+        }
+    }
+    if (click_left && hit_dist[1] >= 0.0f && !click_right) active = 1;
+    if (click_right && hit_dist[0] >= 0.0f) active = 0;
+    if (hit_dist[active] < 0.0f && hit_dist[1 - active] >= 0.0f) active = 1 - active;
+    if (hit_dist[active] < 0.0f) return;
+
+    const auto wnd = g_framework->get_window();
+    if (wnd == nullptr || GetForegroundWindow() != wnd) return;
+    RECT rc{};
+    GetClientRect(wnd, &rc);
+    POINT pt{(LONG)(hit_uv[active][0] * (rc.right - rc.left)), (LONG)(hit_uv[active][1] * (rc.bottom - rc.top))};
+    ClientToScreen(wnd, &pt);
+    // the mouse is used only for the click itself (moved there right before it): a mouse moving all the time made
+    // the game switch its button prompts to the keyboard's and back, and the menus hitched with each switch
+    // the mouse follows the pointer (menu items light up under it), but only when it moved a few pixels: a mouse
+    // moved all the time made the game switch its button prompts to the keyboard's (scripts nudge it back)
+    const bool down = active == 0 ? click_right : click_left;
+    static POINT last{-10000, -10000};
+    const bool moved = hover && (std::abs(pt.x - last.x) > 3 || std::abs(pt.y - last.y) > 3);
+    if (moved || (down && !was_down)) {
+        g_framework->remove_set_cursor_pos_patch();
+        SetCursorPos(pt.x, pt.y);
+        last = pt;
+        eday_menu::moved_at = GetTickCount64();
+    }
+    if (down != was_down) {
+        INPUT in{}; in.type = INPUT_MOUSE; in.mi.dwFlags = down ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP;
+        SendInput(1, &in, sizeof(INPUT));
+        was_down = down;
+    }
+}
+
 namespace vrmod {
 void OverlayComponent::on_reset() {
     m_overlay_data = {};
@@ -376,6 +598,10 @@ void OverlayComponent::update_slate_openvr() {
     const auto width_meters = m_slate_size->value() * aspect;
     vr::VROverlay()->SetOverlayWidthInMeters(m_slate_overlay_handle, width_meters);
 
+    // E-Day: menu pointer - each controller's aim ray against the UI panel; scripts read the hit distances
+    // ("VR_MenuPointerHit") to draw the beams, and the right one (or the last one clicking) moves the mouse.
+    edayMenuPointer(vr.get(), glm_matrix, width_meters, m_slate_size->value());
+
     if (is_d3d11) {
         if (vr->m_d3d11.get_ui_tex().Get() == nullptr) {
             return;
@@ -395,7 +621,16 @@ void OverlayComponent::update_slate_openvr() {
         };
 
         vr::Texture_t ui_tex{(void*)&overlay_tex, vr::TextureType_DirectX12, vr::ColorSpace_Auto};
-        vr::VROverlay()->SetOverlayTexture(m_slate_overlay_handle, &ui_tex);   
+        const auto err = vr::VROverlay()->SetOverlayTexture(m_slate_overlay_handle, &ui_tex);
+
+        static auto last_err = vr::VROverlayError_None;
+        static auto last_log = std::chrono::steady_clock::time_point{};
+        if (err != last_err || std::chrono::steady_clock::now() - last_log > std::chrono::seconds(10)) {
+            last_log = std::chrono::steady_clock::now();
+            spdlog::info("[VR] Slate overlay SetOverlayTexture -> {} (visible: {})", vr::VROverlay()->GetOverlayErrorNameFromEnum(err),
+                vr::VROverlay()->IsOverlayVisible(m_slate_overlay_handle));
+            last_err = err;
+        }
     }
 }
 
@@ -869,6 +1104,18 @@ std::optional<std::reference_wrapper<XrCompositionLayerQuad>> OverlayComponent::
     layer.pose.orientation = runtimes::OpenXR::to_openxr(glm::quat_cast(glm_matrix));
     layer.pose.position = runtimes::OpenXR::to_openxr(glm_matrix[3]);
 
+    // E-Day: menu pointer - each controller's aim ray against this panel (in stage space, as the aim poses), once a
+    // frame; hits and clicks as on OpenVR, the beams/dots are drawn by append_eday_pointer_layers
+    if (is_left_eye) {
+        auto panel = glm_matrix;
+
+        if (vr->m_overlay_component.m_ui_follows_view->value()) {
+            panel = vr->get_transform(0) * glm_matrix; // (view space -> stage space)
+        }
+
+        edayMenuPointer(vr.get(), panel, meters_w, meters_h, false);
+    }
+
     // Check if the controller pointer intersects with the quad, and we can use this to emulate the mouse
     if (vr->is_using_controllers()) {
         // Right only for now for testing
@@ -879,7 +1126,7 @@ std::optional<std::reference_wrapper<XrCompositionLayerQuad>> OverlayComponent::
         const auto start = right_controller_pos;
         auto fwd = (right_controller_rot * glm::vec3{0.0f, 0.0f, -1.0f});
         const auto end = right_controller_pos + (fwd * 1000.0f);
-        
+
         const auto plane_pos = glm::vec3{glm_matrix[3]};
 
         float intersection_distance = 0.0f;
@@ -1129,5 +1376,74 @@ std::optional<std::reference_wrapper<XrCompositionLayerQuad>> OverlayComponent::
     }
 
     return layer;
+}
+
+// E-Day: the menu pointer's beams (thin quads from each controller to where it points, turned to the head) and dots (on
+// the menu where a beam hits), from the beam ends edayMenuPointer worked out this frame. Quad layers in stage space,
+// all of one small solid swapchain, submitted after the menu so they are drawn over it.
+void OverlayComponent::OpenXR::append_eday_pointer_layers(std::vector<XrCompositionLayerBaseHeader*>& layers) {
+    using namespace eday_menu;
+
+    if (!enabled) {
+        return;
+    }
+
+    auto& vr = VR::get();
+    const auto sc_idx = (uint32_t)runtimes::OpenXR::SwapchainIndex::EDAY_BEAM;
+
+    if (!vr->m_openxr->swapchains.contains(sc_idx)) {
+        return;
+    }
+
+    const auto& sc = vr->m_openxr->swapchains[sc_idx];
+    const glm::vec3 head{vr->get_position(0)};
+
+    auto add = [&](XrCompositionLayerQuad& layer, const glm::vec3& xax, const glm::vec3& yax, const glm::vec3& zax, const glm::vec3& pos, float w, float h) {
+        layer = XrCompositionLayerQuad{XR_TYPE_COMPOSITION_LAYER_QUAD};
+        layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+        layer.space = vr->m_openxr->stage_space;
+        layer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+        layer.subImage.swapchain = sc.handle;
+        layer.subImage.imageRect.offset = {0, 0};
+        layer.subImage.imageRect.extent = {(int32_t)sc.width, (int32_t)sc.height};
+        layer.subImage.imageArrayIndex = 0;
+        layer.pose.orientation = runtimes::OpenXR::to_openxr(glm::normalize(glm::quat_cast(glm::mat3{xax, yax, zax})));
+        layer.pose.position = runtimes::OpenXR::to_openxr(pos);
+        layer.size = {w, h};
+        layers.push_back((XrCompositionLayerBaseHeader*)&layer);
+    };
+
+    for (int i = 0; i < 2; ++i) {
+        if (!ray_ok[i]) {
+            continue;
+        }
+
+        const glm::vec3 a{beam[i][0], beam[i][1], beam[i][2]}, b{beam[i][3], beam[i][4], beam[i][5]};
+        const glm::vec3 d = b - a;
+        const float len = glm::length(d);
+
+        if (len < 0.01f) {
+            continue;
+        }
+
+        // beam: y along it, z towards the head (as the OpenVR overlays)
+        const glm::vec3 yax = d / len;
+        const glm::vec3 mid = (a + b) * 0.5f;
+        const glm::vec3 to_eye = head - mid;
+        glm::vec3 zax = to_eye - yax * glm::dot(to_eye, yax);
+        zax = glm::length(zax) < 1e-4f ? glm::vec3{0.0f, 1.0f, 0.0f} : glm::normalize(zax);
+        const glm::vec3 xax = glm::normalize(glm::cross(yax, zax));
+        add(m_eday_layers[i], xax, yax, zax, mid, EDAY_BEAM_W, len);
+
+        // dot: facing the head, where the beam hits the menu
+        if (hit_dist[i] >= 0.0f) {
+            glm::vec3 dz = head - b;
+            dz = glm::length(dz) < 1e-4f ? glm::vec3{0.0f, 0.0f, 1.0f} : glm::normalize(dz);
+            glm::vec3 dx = glm::cross(glm::vec3{0.0f, 1.0f, 0.0f}, dz);
+            dx = glm::length(dx) < 1e-4f ? glm::vec3{1.0f, 0.0f, 0.0f} : glm::normalize(dx);
+            const glm::vec3 dy = glm::cross(dz, dx);
+            add(m_eday_layers[2 + i], dx, dy, dz, b + dz * 0.002f, EDAY_DOT_W, EDAY_DOT_W);
+        }
+    }
 }
 }

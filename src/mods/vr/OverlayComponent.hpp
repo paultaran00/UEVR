@@ -8,6 +8,29 @@
 
 #include "imgui.h"
 
+// E-Day: the menu pointer as seen on the desktop (the menu there is flat, full window): each beam projected from the
+// head onto the menu's plane, so it ends exactly where it points (the hit = the click). Pixels of a W x H image.
+namespace eday_menu {
+struct DesktopPointer {
+    bool beam[2]{};      // right, left
+    float a[2][2]{};     // beam start (px)
+    float b[2][2]{};     // beam end (px)
+    bool dot[2]{};       // the beam hits the menu (dot at b)
+    float beam_px{};     // beam thickness
+    float dot_px{};      // dot diameter
+};
+bool desktop_pointer(float W, float H, DesktopPointer& out);
+}
+
+// E-Day: the monitor (spectator) view steadied against headset tracking noise - the headset itself is untouched
+// (D3D12Component::draw_spectator_view; set "VR_DesktopStabilize" = "on|off [min_cut beta max_deg zoom frame_offset]")
+namespace eday_stab {
+extern bool on;
+extern float min_cut, beta, max_deg, zoom;
+extern int frame_offset;
+extern float last[5]; // correction yaw, pitch, roll (deg), raw head step (deg), frame count
+}
+
 namespace vrmod{
 class D3D11Component;
 class D3D12Component;
@@ -158,6 +181,8 @@ private:
             XrEyeVisibility eye = XR_EYE_VISIBILITY_BOTH
         );
         std::optional<std::reference_wrapper<XrCompositionLayerQuad>> generate_framework_ui_quad();
+        // E-Day: the menu pointer's beams and dots as quad layers (the OpenVR path uses overlays)
+        void append_eday_pointer_layers(std::vector<XrCompositionLayerBaseHeader*>& layers);
         
     private:
         XrCompositionLayerQuad m_slate_layer{};
@@ -165,6 +190,7 @@ private:
         XrCompositionLayerCylinderKHR m_slate_layer_cylinder{};
         XrCompositionLayerCylinderKHR m_slate_layer_cylinder_right{};
         XrCompositionLayerQuad m_framework_ui_layer{};
+        XrCompositionLayerQuad m_eday_layers[4]{}; // beam right, beam left, dot right, dot left
         OverlayComponent* m_parent{ nullptr };
         
         friend class OverlayComponent;

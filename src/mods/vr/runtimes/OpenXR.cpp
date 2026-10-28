@@ -1373,6 +1373,16 @@ void OpenXR::trigger_haptic_vibration(float duration, float frequency, float amp
     haptic_info.action = this->action_set.action_map.find("haptic")->second;
     haptic_info.subactionPath = this->hands[source].path;
 
+    // E-Day: amplitude 0 = stop. A pulse on SteamVR's OpenXR sometimes keeps going (user, 2026-10-22: the right
+    // controller buzzed on after a dash; weak pulses did not end it) - a 0 pulse was ignored, so stop it for real.
+    if (amplitude <= 0.0f) {
+        const auto stop_result = xrStopHapticFeedback(this->session, &haptic_info);
+        if (stop_result != XR_SUCCESS) {
+            spdlog::error("[VR] Failed to stop haptic feedback: {}", this->get_result_string(stop_result));
+        }
+        return;
+    }
+
     XrHapticVibration vibration{XR_TYPE_HAPTIC_VIBRATION};
     vibration.amplitude = amplitude;
     vibration.frequency = frequency;
