@@ -72,7 +72,7 @@ bool is_using_double_precision(uintptr_t addr) {
 
     bool result = false;
 
-    utility::exhaustive_decode((uint8_t*)addr, 50, [&](INSTRUX& ix, uintptr_t ip) -> utility::ExhaustionResult {
+    utility::exhaustive_decode((uint8_t*)addr, 200, [&](INSTRUX& ix, uintptr_t ip) -> utility::ExhaustionResult {
         if (std::string_view{ix.Mnemonic}.starts_with("CALL")) {
             return utility::ExhaustionResult::STEP_OVER;
         }
@@ -85,6 +85,15 @@ bool is_using_double_precision(uintptr_t addr) {
 
         if (ix.Instruction == ND_INS_ADDSD) {
             SPDLOG_INFO("[UE5 Detected] Detected Double precision ADDSD at {:x}", (uintptr_t)ip);
+            result = true;
+            return utility::ExhaustionResult::BREAK;
+        }
+
+        // AVX builds (Gears of War: E-Day) use the VEX forms, e.g. vmovsd xmm, qword ptr [rbx+8].
+        if (ix.Instruction == ND_INS_VADDSD || ix.Instruction == ND_INS_VSUBSD || ix.Instruction == ND_INS_VMULSD ||
+            (ix.Instruction == ND_INS_VMOVSD && (ix.Operands[0].Type == ND_OP_MEM || ix.Operands[1].Type == ND_OP_MEM)))
+        {
+            SPDLOG_INFO("[UE5 Detected] Detected Double precision {} at {:x}", ix.Mnemonic, (uintptr_t)ip);
             result = true;
             return utility::ExhaustionResult::BREAK;
         }
@@ -3902,6 +3911,7 @@ void FFakeStereoRenderingHook::pre_render_viewfamily_renderthread(ISceneViewExte
 bool FFakeStereoRenderingHook::setup_view_extensions() try {
     SPDLOG_INFO("Attempting to set up view extensions...");
 
+
     auto engine = sdk::UEngine::get();
 
     if (engine == nullptr) {
@@ -6438,7 +6448,7 @@ void VRRenderTargetManager_Base::pre_texture_hook_callback(safetyhook::Context& 
         }
     } else {
         const auto target = g_hook->get_render_target_manager()->pre_texture_hook.target_address();
-        func_ptr = target + 5 + *(int32_t*)&insn_bytes.data()[1];
+        func_ptr = rtm->is_pre_texture_hook_at_callee ? target : target + 5 + *(int32_t*)&insn_bytes.data()[1];
     }
 
     SPDLOG_INFO("Function pointer: {:x}", func_ptr);
@@ -6818,7 +6828,60 @@ void VRRenderTargetManager_Base::pre_texture_hook_callback(safetyhook::Context& 
         rtm->ui_target = out.texture;
     } else {
         SPDLOG_INFO("Calling E8 version of texture create");
-        
+
+        const auto near_stack = [&](uintptr_t p) { return p != 0 && std::abs((int64_t)p - (int64_t)ctx.rsp) <= 0x300; };
+
+        // FRHICommandListBase::CreateTexture(const FRHITextureCreateDesc&) -> FTextureRHIRef
+        // RCX = command list (global), RDX = hidden return slot, R8 = desc (Gears of War: E-Day, UE5.5+)
+        if (rtm->is_using_texture_desc && rtm->is_version_greq_5_1 && !near_stack(ctx.rcx) && near_stack(ctx.rdx) && near_stack(ctx.r8)) {
+            SPDLOG_INFO("Command list member form of E8 call detected (UE5 texture desc)...");
+
+            void (*func)(uintptr_t command_list, FTexture2DRHIRef* out, uintptr_t desc) = (decltype(func))func_ptr;
+
+            // Same as the other UE5 paths: swap the eye texture size for the UI texture size while we create ours.
+            const auto scan_x = VR::get()->get_hmd_width() * 2;
+            const auto scan_y = VR::get()->get_hmd_height();
+
+            std::optional<int32_t> width_offset{};
+            int32_t old_width{};
+            int32_t old_height{};
+
+            for (auto i = 0; i < 0x100; ++i) {
+                auto& x = *(int32_t*)(ctx.r8 + i);
+                auto& y = *(int32_t*)(ctx.r8 + i + 4);
+
+                if (x == scan_x && y == scan_y) {
+                    SPDLOG_INFO("UE5: Found render target width and height at offset: {:x}", i);
+                    width_offset = i;
+                    old_width = x;
+                    old_height = y;
+                    x = size.x;
+                    y = size.y;
+
+                    // Same as the register UE5 path: some games have 10 bit format (E-Day's back buffer is R10G10B10A2)
+                    uint8_t* format = (uint8_t*)(ctx.r8 + i + 15);
+                    SPDLOG_INFO("UE5: Render target pixel format: {}", *format);
+
+                    if (*format == 18) {
+                        *format = 2; // PF_B8G8R8A8
+                    }
+
+                    break;
+                }
+            }
+
+            func(ctx.rcx, &out, ctx.r8);
+
+            if (width_offset) {
+                *(int32_t*)(ctx.r8 + *width_offset) = old_width;
+                *(int32_t*)(ctx.r8 + *width_offset + 4) = old_height;
+            }
+
+            if (rtm->texture_hook_ref == nullptr || rtm->texture_hook_ref->texture == nullptr) {
+                SPDLOG_INFO("Had to set texture hook ref in pre texture hook!");
+                rtm->texture_hook_ref = (FTexture2DRHIRef*)ctx.rdx;
+            }
+        } else
         // check if RCX is near the stack pointer
         // if it is then it's a different form of E8 call that takes the texture in the first parameter.
         if (ctx.rcx != 0 && std::abs((int64_t)ctx.rcx - (int64_t)ctx.rsp) <= 0x300) {
@@ -7031,6 +7094,45 @@ void VRRenderTargetManager_Base::texture_hook_callback(safetyhook::Context& ctx,
     }
 
     rtm->allocate_texture_called = false;
+
+    // The pre hook could not be installed (no trampoline memory near the call), so the UI texture was never
+    // created and the game UI ends up drawn over the eye texture. Replay CommandList.CreateTexture here instead.
+    if (rtm->ui_target == nullptr && rtm->is_using_texture_desc && rtm->is_version_greq_5_1 &&
+        rtm->member_form_func != 0 && rtm->member_form_cmdlist != 0 &&
+        (rtm->member_form_desc_base == NDR_RBP || rtm->member_form_desc_base == NDR_RSP))
+    {
+        const auto desc = (rtm->member_form_desc_base == NDR_RBP ? ctx.rbp : ctx.rsp) + rtm->member_form_desc_disp;
+        const auto size = g_framework->is_dx11() ? g_framework->get_d3d11_rt_size() : g_framework->get_d3d12_rt_size();
+        const auto scan_x = VR::get()->get_hmd_width() * 2;
+        const auto scan_y = VR::get()->get_hmd_height();
+
+        for (auto i = 0; i < 0x100; ++i) {
+            auto& x = *(int32_t*)(desc + i);
+            auto& y = *(int32_t*)(desc + i + 4);
+
+            if (x != scan_x || y != scan_y) {
+                continue;
+            }
+
+            auto& format = *(uint8_t*)(desc + i + 15);
+            const auto old_format = format;
+            x = (int32_t)size.x;
+            y = (int32_t)size.y;
+            format = format == 18 ? 2 : format; // 10 bit -> PF_B8G8R8A8, like the other UE5 paths
+
+            static FTexture2DRHIRef out{};
+            void (*func)(uintptr_t command_list, FTexture2DRHIRef* out, uintptr_t desc) = (decltype(func))rtm->member_form_func;
+            func(rtm->member_form_cmdlist, &out, desc);
+
+            x = scan_x;
+            y = scan_y;
+            format = old_format;
+
+            rtm->ui_target = out.texture;
+            SPDLOG_INFO("[Post texture hook] Created UI texture at {:x} (pre hook fallback)", (uintptr_t)out.texture);
+            break;
+        }
+    }
 
     // very rare...
     if (rtm->is_using_texture_desc && !rtm->is_version_greq_5_1) {
@@ -7689,6 +7791,7 @@ void FFakeStereoRenderingHook::attempt_hook_update_viewport_rhi(uintptr_t return
 
     m_attempted_hook_update_viewport_rhi = true;
 
+
     if (m_update_viewport_rhi_hook == nullptr) {
         SPDLOG_INFO("Attempting to hook UpdateViewportRHI...");
 
@@ -7821,6 +7924,20 @@ bool VRRenderTargetManager_Base::allocate_render_target_texture(uintptr_t return
             const auto bytes = (uint8_t*)ip;
             const auto decoded = utility::decode_one((uint8_t*)ip);
 
+            // Remember the latest `lea r8, [reg+disp]` (texture desc) and `lea rcx, [rip+X]` (command list)
+            // so the member form CreateTexture call can be replayed from the post hook.
+            if (decoded && decoded->Instruction == ND_INS_LEA && decoded->Operands[0].Type == ND_OP_REG && decoded->Operands[1].Type == ND_OP_MEM) {
+                const auto reg = decoded->Operands[0].Info.Register.Reg;
+                const auto& mem = decoded->Operands[1].Info.Memory;
+
+                if (reg == NDR_R8 && mem.HasBase && !mem.IsRipRel) {
+                    this->member_form_desc_base = mem.Base;
+                    this->member_form_desc_disp = mem.HasDisp ? (int32_t)mem.Disp : 0;
+                } else if (reg == NDR_RCX && mem.IsRipRel) {
+                    this->member_form_cmdlist = ip + decoded->Length + (int32_t)mem.Disp;
+                }
+            }
+
             if (ip != 0) {
                 for (const auto& pattern : bad_patterns_before_call) {
                     if (utility::scan(ip, 100, pattern).value_or(0) == ip) {
@@ -7892,6 +8009,11 @@ bool VRRenderTargetManager_Base::allocate_render_target_texture(uintptr_t return
                             } else if (utility::find_pattern_in_path((uint8_t*)fn, 30, true, "66 41 C7 40 34 00 FF")) {
                                 SPDLOG_INFO("Found 66 41 C7 40 34 00 FF pattern within the function, skipping this call!");
                                 next_call_is_not_the_right_one = true;
+                            } else if (utility::find_pattern_in_path((uint8_t*)fn, 100, false, "66 C7 41 34 00 FF")) {
+                                // Same FRHITextureCreateDesc constructor, but out-of-line with `this` in RCX (Gears of War: E-Day).
+                                // The real FRHICommandListBase::CreateTexture(desc) call comes right after it.
+                                SPDLOG_INFO("Found 66 C7 41 34 00 FF pattern (texture desc constructor), skipping this call!");
+                                next_call_is_not_the_right_one = true;
                             } else {
                                 // Check how many instructions are in the call. If there's <= 30 AND there's no call/jmp in it, this is not the right one
                                 size_t insn_count = 0;
@@ -7928,6 +8050,8 @@ bool VRRenderTargetManager_Base::allocate_render_target_texture(uintptr_t return
                         if (*(uint8_t*)ip == 0xE8) {
                             SPDLOG_INFO("E8 call found!");
                             this->is_pre_texture_call_e8 = true;
+                            this->member_form_func = utility::calculate_absolute(ip + 1);
+                            SPDLOG_INFO("Member form info: cmdlist {:x}, desc reg {} disp {:x}", this->member_form_cmdlist, this->member_form_desc_base, this->member_form_desc_disp);
                         } else {
                             SPDLOG_INFO("E8 call not found, assuming register call!");
                         }
@@ -8017,6 +8141,33 @@ bool VRRenderTargetManager_Base::allocate_render_target_texture(uintptr_t return
                                 SPDLOG_ERROR("Failed to create pre texture hook: BAD_ALLOCATION: {}", (uint8_t)e.allocator_error);
                             } else {
                                 SPDLOG_ERROR("Failed to create pre texture hook: BAD_INLINE_HOOK: {}", (uint8_t)e.inline_hook_error.type);
+                            }
+
+                            // Relocating the E8 call into a far trampoline can fail (IP-relative out of range).
+                            // Hook the callee's prologue instead and filter on our return address.
+                            if (this->is_pre_texture_call_e8) {
+                                const auto callee = utility::calculate_absolute(ip + 1);
+                                this->pre_texture_hook_retaddr = post_call;
+
+                                auto callee_hook_result = safetyhook::MidHook::create((void*)callee, +[](safetyhook::Context& ctx) -> void {
+                                    auto rtm = g_hook->get_render_target_manager();
+
+                                    if (*(uintptr_t*)ctx.rsp != rtm->pre_texture_hook_retaddr) {
+                                        return;
+                                    }
+
+                                    VRRenderTargetManager::pre_texture_hook_callback(ctx, false);
+                                });
+
+                                if (callee_hook_result.has_value()) {
+                                    SPDLOG_INFO("Created pre texture hook at callee {:x} instead", callee);
+                                    this->pre_texture_hook = std::move(callee_hook_result.value());
+                                    this->is_pre_texture_hook_at_callee = true;
+                                } else {
+                                    const auto ce = callee_hook_result.error();
+                                    SPDLOG_ERROR("Failed to create pre texture hook at callee {:x} too (type {}, inline {}, alloc {})", callee,
+                                        (uint8_t)ce.type, (uint8_t)ce.inline_hook_error.type, (uint8_t)ce.allocator_error);
+                                }
                             }
                         } else {
                             this->pre_texture_hook = std::move(pre_texure_hook_result.value());

@@ -146,6 +146,15 @@ protected:
     bool allocated_views{false};
     bool set_up_texture_hook{false};
     bool is_pre_texture_call_e8{false};
+    bool is_pre_texture_hook_at_callee{false}; // pre hook sits at the E8 call's target instead of the call itself
+    uintptr_t pre_texture_hook_retaddr{0};      // only act on calls returning here when hooked at the callee
+
+    // CommandList.CreateTexture(cmdlist, &out, desc) call site, so the post hook can create the UI texture
+    // itself when the pre hook could not be installed (Gears of War: E-Day).
+    uintptr_t member_form_func{0};
+    uintptr_t member_form_cmdlist{0};   // from `lea rcx, [rip+X]` before the call
+    uint32_t member_form_desc_base{0};  // NDR_* register of `lea r8, [reg+disp]`
+    int32_t member_form_desc_disp{0};
     bool is_using_texture_desc{false};
     bool is_version_greq_5_1{false};
     bool is_version_5_0_3{false};
