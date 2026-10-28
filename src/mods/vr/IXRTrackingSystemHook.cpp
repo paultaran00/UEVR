@@ -1920,6 +1920,13 @@ void IXRTrackingSystemHook::update_view_rotation(sdk::UObject* reference_obj, Ro
             og_controller_rot = glm::quat{vr->get_aim_rotation(controller_index)};
             og_controller_pos = glm::vec3{vr->get_aim_position(controller_index)};
             right_controller_forward = og_controller_rot * glm::vec3{0.0f, 0.0f, 1.0f};
+
+            // E-Day: a script aims with the weapon's barrel instead of the controller's aim pose.
+            glm::vec3 override_pos{}, override_dir{};
+            if (vr->get_aim_override(override_pos, override_dir)) {
+                og_controller_pos = override_pos;
+                right_controller_forward = glm::normalize(override_dir);
+            }
         } else if (aim_type == VR::AimMethod::TWO_HANDED_RIGHT) { // two handed modes are for imitating rifle aiming
             const auto right_controller_index = vr->get_right_controller_index();
             const auto left_controller_index = vr->get_left_controller_index();

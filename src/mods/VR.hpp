@@ -158,6 +158,7 @@ public:
     void update_imgui_state_from_xinput_state(XINPUT_STATE& state, bool is_vr_controller);
 
     void on_pre_engine_tick(sdk::UGameEngine* engine, float delta) override;
+    void feed_gameinput_gamepad();
     void on_pre_calculate_stereo_view_offset(void* stereo_device, const int32_t view_index, Rotator<float>* view_rotation, 
                                              const float world_to_meters, Vector3f* view_location, bool is_double) override;
     void on_pre_viewport_client_draw(void* viewport_client, void* viewport, void* canvas) override;
@@ -304,8 +305,8 @@ public:
     }
 
     bool is_using_controllers() const {
-        return m_controller_test_mode || (m_controllers_allowed->value() &&
-        is_hmd_active() && !m_controllers.empty() && (std::chrono::steady_clock::now() - m_last_controller_update) <= std::chrono::seconds((int32_t)m_motion_controls_inactivity_timer->value()));
+        // E-Day: no inactivity timeout. The weapon and hands live on the controllers, they must never fall back to the body.
+        return m_controller_test_mode || (m_controllers_allowed->value() && is_hmd_active() && !m_controllers.empty());
     }
 
     bool is_using_controllers_within(std::chrono::seconds seconds) const {
@@ -612,6 +613,24 @@ public:
         return m_controller_pitch_offset->value();
     }
 
+    // E-Day: scripts can replace the aim ray (VR tracking space, like get_aim_position) with their own,
+    // e.g. the barrel of a weapon held in the hands. Expires if not refreshed every frame.
+    void set_aim_override(const glm::vec3& pos, const glm::vec3& dir) {
+        m_aim_override_pos = pos;
+        m_aim_override_dir = dir;
+        m_aim_override_time = std::chrono::steady_clock::now();
+    }
+
+    bool get_aim_override(glm::vec3& pos, glm::vec3& dir) const {
+        if (std::chrono::steady_clock::now() - m_aim_override_time > std::chrono::milliseconds(250)) {
+            return false;
+        }
+
+        pos = m_aim_override_pos;
+        dir = m_aim_override_dir;
+        return true;
+    }
+
     bool should_skip_post_init_properties() const {
         return m_compatibility_skip_pip->value();
     }
@@ -822,6 +841,9 @@ private:
     vr::VRInputValueHandle_t m_right_joystick{};
 
     std::chrono::steady_clock::time_point m_last_controller_update{};
+    glm::vec3 m_aim_override_pos{};
+    glm::vec3 m_aim_override_dir{};
+    std::chrono::steady_clock::time_point m_aim_override_time{};
     std::chrono::steady_clock::time_point m_last_xinput_update{};
     std::chrono::steady_clock::time_point m_last_xinput_spoof_sent{};
     std::chrono::steady_clock::time_point m_last_xinput_l3_r3_menu_open{};

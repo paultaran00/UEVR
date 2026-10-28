@@ -19,6 +19,7 @@
 #include <tracy/Tracy.hpp>
 
 #include "Framework.hpp"
+#include "Mods.hpp"
 #include "frameworkConfig.hpp"
 
 #include "utility/Logging.hpp"
@@ -1364,11 +1365,56 @@ void VR::update_imgui_state_from_xinput_state(XINPUT_STATE& state, bool is_vr_co
     ZeroMemory(&state.Gamepad, sizeof(XINPUT_GAMEPAD));
 }
 
+// Gears of War: E-Day reads gamepads only through GameInput, never XInput. gameinput_vr.dll (loaded at launch by
+// inject_launch.py) gives the game a virtual GameInput gamepad; push it the same state the XInput hook would produce.
+void VR::feed_gameinput_gamepad() {
+    using set_gamepad_t = void (*)(uint32_t, float, float, float, float, float, float);
+    static const auto set_gamepad = []() -> set_gamepad_t {
+        const auto mod = GetModuleHandleW(L"gameinput_vr.dll");
+        return mod != nullptr ? (set_gamepad_t)GetProcAddress(mod, "gameinput_vr_set_gamepad") : nullptr;
+    }();
+
+    if (set_gamepad == nullptr) {
+        return;
+    }
+
+    XINPUT_STATE xs{};
+    uint32_t ret = ERROR_DEVICE_NOT_CONNECTED;
+
+    // Same chain as a real XInputGetState call, so plugins/Lua scripts can edit the state too.
+    for (auto& mod : g_framework->get_mods()->get_mods()) {
+        mod->on_xinput_get_state(&ret, 0, &xs);
+    }
+
+    // XInput button -> GameInputGamepadButtons
+    static constexpr std::array<std::pair<uint16_t, uint32_t>, 14> button_map{{
+        {XINPUT_GAMEPAD_START, 0x1}, {XINPUT_GAMEPAD_BACK, 0x2}, {XINPUT_GAMEPAD_A, 0x4}, {XINPUT_GAMEPAD_B, 0x8},
+        {XINPUT_GAMEPAD_X, 0x10}, {XINPUT_GAMEPAD_Y, 0x20}, {XINPUT_GAMEPAD_DPAD_UP, 0x40}, {XINPUT_GAMEPAD_DPAD_DOWN, 0x80},
+        {XINPUT_GAMEPAD_DPAD_LEFT, 0x100}, {XINPUT_GAMEPAD_DPAD_RIGHT, 0x200}, {XINPUT_GAMEPAD_LEFT_SHOULDER, 0x400},
+        {XINPUT_GAMEPAD_RIGHT_SHOULDER, 0x800}, {XINPUT_GAMEPAD_LEFT_THUMB, 0x1000}, {XINPUT_GAMEPAD_RIGHT_THUMB, 0x2000},
+    }};
+
+    const auto& g = xs.Gamepad;
+    uint32_t buttons = 0;
+
+    for (const auto& [xinput, gameinput] : button_map) {
+        if ((g.wButtons & xinput) != 0) {
+            buttons |= gameinput;
+        }
+    }
+
+    const auto axis = [](SHORT v) { return std::clamp((float)v / 32767.0f, -1.0f, 1.0f); };
+    set_gamepad(buttons, (float)g.bLeftTrigger / 255.0f, (float)g.bRightTrigger / 255.0f,
+        axis(g.sThumbLX), axis(g.sThumbLY), axis(g.sThumbRX), axis(g.sThumbRY));
+}
+
 void VR::on_pre_engine_tick(sdk::UGameEngine* engine, float delta) {
     ZoneScopedN(__FUNCTION__);
 
     m_cvar_manager->on_pre_engine_tick(engine, delta);
     m_last_engine_tick = std::chrono::steady_clock::now();
+
+    feed_gameinput_gamepad();
 
     if (!get_runtime()->loaded || !is_hmd_active()) {
         return;
@@ -1650,7 +1696,10 @@ void VR::update_action_states() {
     }
 
     const auto last_xinput_update_is_late = std::chrono::steady_clock::now() - m_last_xinput_update >= std::chrono::seconds(2);
-    const auto should_be_spoofing = (actively_using_controller || get_runtime()->handle_pause);
+    // Only while the game window is in front: an unfocused game never polls XInput, so this kept posting
+    // WM_DEVICECHANGE every ~2 s, and E-Day crashes (null deref at 1439613ec) on repeated device changes.
+    const auto game_has_focus = GetForegroundWindow() == g_framework->get_window();
+    const auto should_be_spoofing = game_has_focus && (actively_using_controller || get_runtime()->handle_pause);
 
     if (m_spoofed_gamepad_connection && last_xinput_update_is_late && should_be_spoofing) {
         m_spoofed_gamepad_connection = false;
@@ -1659,7 +1708,8 @@ void VR::update_action_states() {
     if (!m_spoofed_gamepad_connection && last_xinput_update_is_late && should_be_spoofing) {
         spdlog::info("[VR] Attempting to spoof gamepad connection");
         g_framework->post_message(WM_DEVICECHANGE, 0, 0);
-        g_framework->activate_window();
+        // No activate_window() here: the game stops polling XInput as soon as it loses focus, so this ran every
+        // ~2 s and kept yanking focus back from any other app the user switched to (E-Day).
 
         m_last_xinput_spoof_sent = std::chrono::steady_clock::now();
     }
