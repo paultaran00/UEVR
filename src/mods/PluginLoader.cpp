@@ -1908,7 +1908,8 @@ void PluginLoader::early_init() try {
         }
     };
 
-    load_plugins_from_dir(global_plugins_path);
+    // eday: the global UEVR\plugins folder is not loaded (other mods' plugins there hung the game at startup); only this profile's plugins
+    spdlog::info("[PluginLoader] eday: skipping global plugins folder {}", global_plugins_path.string());
     load_plugins_from_dir(plugin_path);
 } catch(const std::exception& e) {
     spdlog::error("[PluginLoader] Exception during early init {}", e.what());
