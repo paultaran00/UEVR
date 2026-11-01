@@ -1908,8 +1908,14 @@ void PluginLoader::early_init() try {
         }
     };
 
-    // eday: the global UEVR\plugins folder is not loaded (other mods' plugins there hung the game at startup); only this profile's plugins
-    spdlog::info("[PluginLoader] eday: skipping global plugins folder {}", global_plugins_path.string());
+    // eday: the global UEVR\plugins folder is not loaded by default (other mods' plugins there hung the game at startup);
+    // only if the launcher's "Load global UEVR plugins" option created the flag file <profile>\load_global_plugins
+    if (fs::exists(Framework::get_persistent_dir() / "load_global_plugins")) {
+        spdlog::info("[PluginLoader] eday: global plugins folder loaded (load_global_plugins present) {}", global_plugins_path.string());
+        load_plugins_from_dir(global_plugins_path);
+    } else {
+        spdlog::info("[PluginLoader] eday: skipping global plugins folder {} (no load_global_plugins file)", global_plugins_path.string());
+    }
     load_plugins_from_dir(plugin_path);
 } catch(const std::exception& e) {
     spdlog::error("[PluginLoader] Exception during early init {}", e.what());
