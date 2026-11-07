@@ -596,6 +596,7 @@ sol::object call_function(sol::this_state s, uevr::API::UObject* self, uevr::API
     //std::vector<uint8_t> dynamic_data{};
     std::vector<std::unique_ptr<wchar_t[]>> dynamic_strings{};
     std::vector<std::vector<uevr::API::UObject*>> dynamic_object_arrays{};
+    std::vector<std::vector<uint8_t>> dynamic_struct_arrays{}; // eday: arrays of structs passed as a table of tables
     std::unordered_map<uevr::API::FProperty*, size_t> prop_to_arg_index{}; // For out parameters
 
     for (auto arg_desc = fn_args; arg_desc != nullptr; arg_desc = arg_desc->get_next()) {
@@ -693,6 +694,50 @@ sol::object call_function(sol::this_state s, uevr::API::UObject* self, uevr::API
             const auto inner_name_hash = ::utility::hash(inner_c->get_fname()->to_string());
 
             switch (inner_name_hash) {
+            case L"StructProperty"_fnv:
+            {
+                // eday: Lua table of tables -> TArray<struct> (e.g. SceneCaptureComponent:SetShowFlagSettings({ {ShowFlagName="Fog", Enabled=false} }))
+                const auto arg_obj = args[args_index++];
+                const auto struct_desc = ((uevr::API::FStructProperty*)inner_prop)->get_struct();
+
+                if (!arg_obj.is<sol::lua_table>() || struct_desc == nullptr) {
+                    throw sol::error("Invalid argument type for ArrayProperty<StructProperty>");
+                }
+
+                const auto arg_table = arg_obj.as<sol::lua_table>();
+                const auto elem_size = (size_t)((uevr::API::UScriptStruct*)struct_desc)->get_struct_size();
+                auto& buf = dynamic_struct_arrays.emplace_back();
+                buf.resize(std::max<size_t>(1, arg_table.size() * elem_size), 0);
+
+                for (size_t i = 0; i < arg_table.size(); ++i) {
+                    sol::object elem = arg_table[i + 1];
+                    auto base = (void*)&buf[i * elem_size];
+
+                    if (elem.is<sol::lua_table>()) {
+                        for (const auto& [key, val] : elem.as<sol::table>()) {
+                            if (!key.is<std::wstring>()) {
+                                throw sol::error("Invalid key type for struct array element (expected string)");
+                            }
+
+                            const auto prop = struct_desc->find_property(key.as<std::wstring>().c_str());
+
+                            if (prop == nullptr) {
+                                throw sol::error("Struct array element: property not found");
+                            }
+
+                            set_property(s, base, struct_desc, prop, val, &dynamic_strings);
+                        }
+                    } else if (elem.is<lua::datatypes::StructObject>()) {
+                        memcpy(base, elem.as<lua::datatypes::StructObject>().object, elem_size);
+                    }
+                }
+
+                auto& arr = *(uevr::API::TArray<uint8_t>*)&params[offset];
+                arr.count = (int32_t)arg_table.size();
+                arr.capacity = (int32_t)arg_table.size();
+                arr.data = buf.data();
+                break;
+            }
             case L"InterfaceProperty"_fnv:
             case L"ObjectProperty"_fnv:
             case L"ClassProperty"_fnv:
