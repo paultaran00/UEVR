@@ -2887,7 +2887,7 @@ struct SceneViewExtensionAnalyzer {
 
         if (last_command == nullptr || *(void**)last_command == nullptr) {
             SPDLOG_INFO("Cannot hook command with no vtable, falling back to passing current frame count to runtime");
-            runtime->enqueue_render_poses(frame_count);
+            runtime->enqueue_render_poses_paired(frame_count);
             return;
         }
 
